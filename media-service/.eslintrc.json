@@ -1,0 +1,22 @@
+{
+  "root": true,
+  "env": {
+    "node": true,
+    "es2023": true
+  },
+  "parserOptions": {
+    "sourceType": "module",
+    "ecmaVersion": 2023
+  },
+  "plugins": ["import", "promise", "prettier"],
+  "extends": [
+    "eslint:recommended",
+    "plugin:import/recommended",
+    "plugin:promise/recommended",
+    "plugin:prettier/recommended"
+  ],
+  "rules": {
+    "import/no-unresolved": "off",
+    "prettier/prettier": "error"
+  }
+}
