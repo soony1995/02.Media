@@ -25,12 +25,23 @@ if (appConfig.storage.endpoint) {
 
 const s3 = new S3Client(s3Config)
 
+const presignClientConfig: S3ClientConfig = {
+  ...s3Config,
+}
+
+if (appConfig.storage.publicEndpoint) {
+  presignClientConfig.endpoint = appConfig.storage.publicEndpoint
+}
+
+const s3Presign = new S3Client(presignClientConfig)
+
 const bucket = appConfig.storage.bucket
 
 export async function uploadObject(params: {
   key: string
   body: Buffer
   contentType: string
+  contentDisposition?: string
   metadata?: Record<string, string>
 }): Promise<void> {
   const command = new PutObjectCommand({
@@ -38,6 +49,7 @@ export async function uploadObject(params: {
     Key: params.key,
     Body: params.body,
     ContentType: params.contentType,
+    ContentDisposition: params.contentDisposition,
     Metadata: params.metadata,
   })
   await s3.send(command)
@@ -62,18 +74,20 @@ export async function generatePresignedUploadUrl(params: {
     Key: params.key,
     ContentType: params.contentType,
   })
-  return getSignedUrl(s3, command, { expiresIn: params.expiresIn })
+  return getSignedUrl(s3Presign, command, { expiresIn: params.expiresIn })
 }
 
 export async function generatePresignedDownloadUrl(params: {
   key: string
   expiresIn: number
+  responseContentDisposition?: string
 }): Promise<string> {
   const command = new GetObjectCommand({
     Bucket: bucket,
     Key: params.key,
+    ResponseContentDisposition: params.responseContentDisposition,
   })
-  return getSignedUrl(s3, command, { expiresIn: params.expiresIn })
+  return getSignedUrl(s3Presign, command, { expiresIn: params.expiresIn })
 }
 
 export function buildPublicUrl(key: string): string {

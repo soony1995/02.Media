@@ -8,6 +8,24 @@ const DEFAULT_ALLOWED_TYPES = [
   'image/avif',
 ]
 
+function envBoolean(defaultValue: boolean) {
+  return z.preprocess((value) => {
+    if (typeof value === 'boolean') {
+      return value
+    }
+    if (typeof value === 'string') {
+      const normalized = value.trim().toLowerCase()
+      if (['true', '1', 'yes', 'y', 'on'].includes(normalized)) {
+        return true
+      }
+      if (['false', '0', 'no', 'n', 'off', ''].includes(normalized)) {
+        return false
+      }
+    }
+    return value
+  }, z.boolean().default(defaultValue))
+}
+
 const envSchema = z.object({
   NODE_ENV: z.string().default('development'),
   PORT: z.coerce.number().default(4000),
@@ -17,9 +35,10 @@ const envSchema = z.object({
   STORAGE_BUCKET: z.string().min(1),
   STORAGE_REGION: z.string().default('us-east-1'),
   STORAGE_ENDPOINT: z.string().optional(),
+  STORAGE_PUBLIC_ENDPOINT: z.string().optional(),
   STORAGE_ACCESS_KEY: z.string().min(1),
   STORAGE_SECRET_KEY: z.string().min(1),
-  STORAGE_FORCE_PATH_STYLE: z.coerce.boolean().default(true),
+  STORAGE_FORCE_PATH_STYLE: envBoolean(true),
   CDN_BASE_URL: z.string().optional(),
   PRESIGN_EXPIRATION_SECONDS: z.coerce.number().default(900),
   RATE_LIMIT_WINDOW_SECONDS: z.coerce.number().default(60),
@@ -29,7 +48,7 @@ const envSchema = z.object({
   JWT_PUBLIC_KEY: z.string().optional(),
   JWT_AUDIENCE: z.string().optional(),
   JWT_ISSUER: z.string().optional(),
-  PUBLIC_READ: z.coerce.boolean().default(false),
+  PUBLIC_READ: envBoolean(false),
 })
 
 const rawConfig = envSchema.parse(process.env)
@@ -48,6 +67,7 @@ export const config = {
     bucket: rawConfig.STORAGE_BUCKET,
     region: rawConfig.STORAGE_REGION,
     endpoint: rawConfig.STORAGE_ENDPOINT,
+    publicEndpoint: rawConfig.STORAGE_PUBLIC_ENDPOINT,
     accessKey: rawConfig.STORAGE_ACCESS_KEY,
     secretKey: rawConfig.STORAGE_SECRET_KEY,
     forcePathStyle: rawConfig.STORAGE_FORCE_PATH_STYLE,

@@ -4,6 +4,6 @@ import type { Request, Response, NextFunction } from 'express'
 export function errorHandler(err: Error, _req: Request, res: Response, _next: NextFunction) {
   const status = (err as any).statusCode ?? 500
   // eslint-disable-next-line no-console
-  console.error(err)
+  console.error('[Global Error Handler]', err)
   res.status(status).json({ message: err.message || 'Internal server error' })
 }

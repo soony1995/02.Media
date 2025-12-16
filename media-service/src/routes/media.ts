@@ -1,4 +1,5 @@
-import { Router, type Request } from 'express'
+import path from 'node:path'
+import { Router, type Request, type RequestHandler } from 'express'
 import multer from 'multer'
 import sharp from 'sharp'
 import { z } from 'zod'
@@ -24,6 +25,25 @@ const upload = multer({
     fileSize: config.maxUploadBytes,
   },
 })
+
+const uploadSingleFile: RequestHandler = (req, res, next) => {
+  upload.single('file')(req, res, (error) => {
+    if (!error) {
+      return next()
+    }
+
+    if (error instanceof multer.MulterError) {
+      if (error.code === 'LIMIT_FILE_SIZE') {
+        return res.status(413).json({
+          message: `File exceeds size limit (${config.maxUploadBytes} bytes)`,
+        })
+      }
+      return res.status(400).json({ message: error.message })
+    }
+
+    return next(error)
+  })
+}
 
 const presignSchema = z.object({
   fileName: z.string().min(1),
@@ -56,25 +76,88 @@ function assertMimeType(mimeType: string) {
   }
 }
 
-function buildObjectKey(userId: string, fileName: string): string {
-  const sanitized = fileName.replace(/[^\w.\-]/g, '_')
-  return `uploads/${userId}/${Date.now()}-${sanitized}`
+function normalizeUploadFilename(originalName: string): string {
+  const hasOnlyLatin1 = Array.from(originalName).every((char) => char.charCodeAt(0) <= 0xff)
+  if (!hasOnlyLatin1) {
+    return originalName
+  }
+
+  const decoded = Buffer.from(originalName, 'latin1').toString('utf8')
+  if (decoded.includes('\uFFFD')) {
+    return originalName
+  }
+  return decoded
 }
 
-async function buildDownloadUrl(key: string): Promise<string> {
+function encodeRFC5987Value(value: string): string {
+  return encodeURIComponent(value).replace(/[!'()*]/g, (char) => {
+    return `%${char.charCodeAt(0).toString(16).toUpperCase()}`
+  })
+}
+
+function buildContentDisposition(originalName: string, fallbackName: string): string {
+  const encoded = encodeRFC5987Value(originalName)
+  return `inline; filename="${fallbackName}"; filename*=UTF-8''${encoded}`
+}
+
+function extensionFrom(mimeType: string, fileName?: string): string {
+  const byMime: Record<string, string> = {
+    'image/jpeg': 'jpg',
+    'image/png': 'png',
+    'image/webp': 'webp',
+    'image/gif': 'gif',
+    'image/avif': 'avif',
+  }
+
+  const mapped = byMime[mimeType]
+  if (mapped) {
+    return mapped
+  }
+
+  const rawExt = fileName ? path.extname(fileName).toLowerCase().slice(1) : ''
+  const safeExt = rawExt.replace(/[^a-z0-9]+/g, '')
+  return safeExt
+}
+
+function buildObjectKey(userId: string, id: string, extension: string): string {
+  const suffix = extension ? `.${extension}` : ''
+  return `uploads/${userId}/${id}${suffix}`
+}
+
+function buildAsciiFallbackFilename(originalName: string, extension: string): string {
+  const base = path.basename(originalName, path.extname(originalName))
+  const normalizedBase = base
+    .normalize('NFKD')
+    .replace(/[^\w.\-]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+  const fileBase = normalizedBase && /[a-z0-9]/i.test(normalizedBase) ? normalizedBase : 'file'
+  const safeExt = extension ? `.${extension}` : ''
+  return `${fileBase}${safeExt}`.slice(0, 180)
+}
+
+async function buildDownloadUrl(key: string, originalName?: string): Promise<string> {
   if (config.publicRead && config.cdnBaseUrl) {
     return buildPublicUrl(key)
   }
+
+  const responseContentDisposition = originalName
+    ? buildContentDisposition(
+        originalName,
+        buildAsciiFallbackFilename(originalName, extensionFrom('application/octet-stream', originalName)),
+      )
+    : undefined
+
   return generatePresignedDownloadUrl({
     key,
     expiresIn: config.presignExpirationSeconds,
+    responseContentDisposition,
   })
 }
 
 router.post(
   '/media/upload',
   rateLimitMiddleware,
-  upload.single('file'),
+  uploadSingleFile,
   asyncHandler(async (req, res) => {
     ensureUser(req)
     if (!req.file) {
@@ -82,24 +165,37 @@ router.post(
     }
     assertMimeType(req.file.mimetype)
 
-    const metadata = await sharp(req.file.buffer).metadata()
+    let metadata: sharp.Metadata
+    try {
+      metadata = await sharp(req.file.buffer).metadata()
+    } catch (error) {
+      const details = error instanceof Error ? error.message : 'Unknown error'
+      const message =
+        config.nodeEnv === 'production' ? 'Invalid image file' : `Invalid image file: ${details}`
+
+      return res.status(400).json({ message })
+    }
     const id = uuid()
-    const key = buildObjectKey(req.user!.id, req.file.originalname || id)
+    const originalNameRaw = req.file.originalname ?? 'unknown'
+    const originalName = normalizeUploadFilename(originalNameRaw)
+    const extension = extensionFrom(req.file.mimetype, originalName)
+    const key = buildObjectKey(req.user!.id, id, extension)
+    const fallbackFilename = buildAsciiFallbackFilename(originalName, extension)
 
     await uploadObject({
       key,
       body: req.file.buffer,
       contentType: req.file.mimetype,
+      contentDisposition: buildContentDisposition(originalName, fallbackFilename),
       metadata: {
         owner: req.user!.id,
-        originalName: req.file.originalname ?? 'unknown',
       },
     })
 
     const record = await db.createMediaObject({
       id,
       ownerId: req.user!.id,
-      originalName: req.file.originalname ?? 'unknown',
+      originalName,
       storedKey: key,
       mimeType: req.file.mimetype,
       sizeBytes: req.file.size,
@@ -115,7 +211,7 @@ router.post(
       timestamp: new Date().toISOString(),
     })
 
-    const downloadUrl = await buildDownloadUrl(record.storedKey)
+    const downloadUrl = await buildDownloadUrl(record.storedKey, record.originalName)
 
     return res.status(201).json({
       ...record,
@@ -139,7 +235,9 @@ router.post(
       return res.status(400).json({ message: 'File exceeds size limit' })
     }
 
-    const key = buildObjectKey(req.user!.id, payload.data.fileName)
+    const uploadId = uuid()
+    const extension = extensionFrom(payload.data.mimeType, payload.data.fileName)
+    const key = buildObjectKey(req.user!.id, uploadId, extension)
     const uploadUrl = await generatePresignedUploadUrl({
       key,
       contentType: payload.data.mimeType,
@@ -147,6 +245,7 @@ router.post(
     })
 
     return res.status(201).json({
+      id: uploadId,
       uploadUrl,
       key,
       expiresIn: config.presignExpirationSeconds,
@@ -183,7 +282,8 @@ router.get(
 
     const itemsWithUrls = await Promise.all(
       result.items.map(async (item) => {
-        const url = item.status === 'ACTIVE' ? await buildDownloadUrl(item.storedKey) : null
+        const url =
+          item.status === 'ACTIVE' ? await buildDownloadUrl(item.storedKey, item.originalName) : null
         return { ...item, url }
       }),
     )
@@ -210,15 +310,24 @@ router.get(
     const includePresign = String(req.query.presign).toLowerCase() === 'true'
     let presignedUrl: string | undefined
     if (includePresign) {
+      const responseContentDisposition = buildContentDisposition(
+        media.originalName,
+        buildAsciiFallbackFilename(
+          media.originalName,
+          extensionFrom('application/octet-stream', media.originalName),
+        ),
+      )
+
       presignedUrl = await generatePresignedDownloadUrl({
         key: media.storedKey,
         expiresIn: config.presignExpirationSeconds,
+        responseContentDisposition,
       })
     }
 
     return res.json({
       ...media,
-      url: media.status === 'ACTIVE' ? buildPublicUrl(media.storedKey) : null,
+      url: media.status === 'ACTIVE' ? await buildDownloadUrl(media.storedKey, media.originalName) : null,
       presignedUrl,
     })
   }),

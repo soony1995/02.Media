@@ -1,3 +1,8 @@
 docs
 AGENTS.md
 .DS_Store
+media-service/node_modules
+media-service/dist
+media-service/.env
+media-service/*.log
+media-service/coverage
