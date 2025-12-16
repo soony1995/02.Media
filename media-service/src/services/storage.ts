@@ -94,8 +94,9 @@ export function buildPublicUrl(key: string): string {
   if (appConfig.cdnBaseUrl) {
     return `${appConfig.cdnBaseUrl.replace(/\/$/, '')}/${key}`
   }
-  if (appConfig.storage.endpoint) {
-    return `${appConfig.storage.endpoint.replace(/\/$/, '')}/${bucket}/${encodeURI(key)}`
+  const baseEndpoint = appConfig.storage.publicEndpoint || appConfig.storage.endpoint
+  if (baseEndpoint) {
+    return `${baseEndpoint.replace(/\/$/, '')}/${bucket}/${encodeURI(key)}`
   }
   return `https://${bucket}.s3.${appConfig.storage.region}.amazonaws.com/${key}`
 }
