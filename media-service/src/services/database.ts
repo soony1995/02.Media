@@ -1,7 +1,7 @@
+import { Kysely, PostgresDialect, type Selectable } from 'kysely'
 import { Pool } from 'pg'
 import { config } from '../config.js'
-
-export type MediaStatus = 'ACTIVE' | 'DELETED'
+import { type Database, type MediaObjectsTable, type MediaStatus } from './database/schema.js'
 
 export interface MediaObject {
   id: string
@@ -32,30 +32,30 @@ const pool = new Pool({
   connectionString: config.databaseUrl,
 })
 
+const kysely = new Kysely<Database>({
+  dialect: new PostgresDialect({
+    pool,
+  }),
+})
+
 export const db = {
   async createMediaObject(input: CreateMediaObjectInput): Promise<MediaObject> {
-    const query = `
-      INSERT INTO media_objects (
-        id, owner_id, original_name, stored_key,
-        mime_type, size_bytes, width, height, status
-      ) VALUES (
-        $1, $2, $3, $4,
-        $5, $6, $7, $8, 'ACTIVE'
-      )
-      RETURNING *
-    `
-    const values = [
-      input.id,
-      input.ownerId,
-      input.originalName,
-      input.storedKey,
-      input.mimeType,
-      input.sizeBytes,
-      input.width,
-      input.height,
-    ]
-    const result = await pool.query(query, values)
-    return mapRow(result.rows[0])
+    const record = await kysely
+      .insertInto('media_objects')
+      .values({
+        id: input.id,
+        owner_id: input.ownerId,
+        original_name: input.originalName,
+        stored_key: input.storedKey,
+        mime_type: input.mimeType,
+        size_bytes: input.sizeBytes,
+        width: input.width,
+        height: input.height,
+        status: 'ACTIVE',
+      })
+      .returningAll()
+      .executeTakeFirstOrThrow()
+    return mapRow(record)
   },
 
   async listMediaObjects(params: {
@@ -64,71 +64,65 @@ export const db = {
     cursor?: string
     includeDeleted?: boolean
   }): Promise<{ items: MediaObject[]; nextCursor?: string }> {
-    const conditions: string[] = []
-    const values: Array<string | number | boolean | Date> = []
+    let query = kysely.selectFrom('media_objects').selectAll()
     if (!params.includeDeleted) {
-      conditions.push(`status = 'ACTIVE'`)
+      query = query.where('status', '=', 'ACTIVE')
     }
     if (params.ownerId) {
-      values.push(params.ownerId)
-      conditions.push(`owner_id = $${values.length}`)
+      query = query.where('owner_id', '=', params.ownerId)
     }
     if (params.cursor) {
       const cursorDate = new Date(params.cursor)
       if (Number.isNaN(cursorDate.getTime())) {
         throw new Error('Invalid cursor')
       }
-      values.push(cursorDate)
-      conditions.push(`uploaded_at < $${values.length}`)
+      query = query.where('uploaded_at', '<', cursorDate)
     }
 
-    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
+    const records = await query
+      .orderBy('uploaded_at', 'desc')
+      .limit(params.limit + 1)
+      .execute()
 
-    values.push(params.limit + 1)
-    const limitPlaceholder = `$${values.length}`
-
-    const query = `
-      SELECT * FROM media_objects
-      ${whereClause}
-      ORDER BY uploaded_at DESC
-      LIMIT ${limitPlaceholder}
-    `
-
-    const result = await pool.query(query, values)
-    const rows = result.rows.map(mapRow)
-    if (rows.length > params.limit) {
-      const nextCursor = rows[params.limit].uploadedAt.toISOString()
-      return { items: rows.slice(0, params.limit), nextCursor }
+    const items = records.map(mapRow)
+    if (items.length > params.limit) {
+      const nextCursor = items[params.limit].uploadedAt.toISOString()
+      return { items: items.slice(0, params.limit), nextCursor }
     }
-    return { items: rows }
+    return { items }
   },
 
   async getMediaObjectById(id: string): Promise<MediaObject | null> {
-    const result = await pool.query(`SELECT * FROM media_objects WHERE id = $1`, [id])
-    if (result.rowCount === 0) {
+    const record = await kysely
+      .selectFrom('media_objects')
+      .selectAll()
+      .where('id', '=', id)
+      .executeTakeFirst()
+    if (!record) {
       return null
     }
-    return mapRow(result.rows[0])
+    return mapRow(record)
   },
 
   async softDeleteMediaObject(id: string): Promise<MediaObject | null> {
-    const result = await pool.query(
-      `
-      UPDATE media_objects
-      SET status = 'DELETED', deleted_at = NOW()
-      WHERE id = $1 AND status != 'DELETED'
-      RETURNING *
-    `,
-      [id],
-    )
-    if (result.rowCount === 0) {
+    const record = await kysely
+      .updateTable('media_objects')
+      .set({
+        status: 'DELETED',
+        deleted_at: new Date(),
+      })
+      .where('id', '=', id)
+      .where('status', '!=', 'DELETED')
+      .returningAll()
+      .executeTakeFirst()
+    if (!record) {
       return null
     }
-    return mapRow(result.rows[0])
+    return mapRow(record)
   },
 }
 
-function mapRow(row: any): MediaObject {
+function mapRow(row: Selectable<MediaObjectsTable>): MediaObject {
   return {
     id: row.id,
     ownerId: row.owner_id,
@@ -138,7 +132,7 @@ function mapRow(row: any): MediaObject {
     sizeBytes: Number(row.size_bytes),
     width: row.width !== null ? Number(row.width) : null,
     height: row.height !== null ? Number(row.height) : null,
-    status: row.status,
+    status: row.status as MediaStatus,
     uploadedAt: row.uploaded_at,
     deletedAt: row.deleted_at,
   }
