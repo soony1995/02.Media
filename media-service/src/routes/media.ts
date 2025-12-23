@@ -26,8 +26,11 @@ const upload = multer({
   },
 })
 
-const uploadSingleFile: RequestHandler = (req, res, next) => {
-  upload.single('file')(req, res, (error) => {
+const uploadMultipleFiles: RequestHandler = (req, res, next) => {
+  upload.fields([
+    { name: 'file', maxCount: 1 },
+    { name: 'files', maxCount: 10 },
+  ])(req, res, (error) => {
     if (!error) {
       return next()
     }
@@ -157,66 +160,100 @@ async function buildDownloadUrl(key: string, originalName?: string): Promise<str
 router.post(
   '/media/upload',
   rateLimitMiddleware,
-  uploadSingleFile,
+  uploadMultipleFiles,
   asyncHandler(async (req, res) => {
     ensureUser(req)
-    if (!req.file) {
+    const files: Array<Express.Multer.File> = []
+    const uploadedFiles = req.files as Record<string, Express.Multer.File[]> | undefined
+    if (uploadedFiles?.file?.[0]) {
+      files.push(uploadedFiles.file[0])
+    }
+    if (uploadedFiles?.files?.length) {
+      files.push(...uploadedFiles.files)
+    }
+    if ((req as any).file) {
+      files.push((req as any).file)
+    }
+
+    if (files.length === 0) {
       return res.status(400).json({ message: 'file field is required' })
     }
-    assertMimeType(req.file.mimetype)
 
-    let metadata: sharp.Metadata
-    try {
-      metadata = await sharp(req.file.buffer).metadata()
-    } catch (error) {
-      const details = error instanceof Error ? error.message : 'Unknown error'
-      const message =
-        config.nodeEnv === 'production' ? 'Invalid image file' : `Invalid image file: ${details}`
+    const items = []
+    const failed = []
 
-      return res.status(400).json({ message })
+    for (const file of files) {
+      try {
+        assertMimeType(file.mimetype)
+
+        let metadata: sharp.Metadata
+        try {
+          metadata = await sharp(file.buffer).metadata()
+        } catch (error) {
+          const details = error instanceof Error ? error.message : 'Unknown error'
+          const message =
+            config.nodeEnv === 'production' ? 'Invalid image file' : `Invalid image file: ${details}`
+          throw new Error(message)
+        }
+
+        const id = uuid()
+        const originalNameRaw = file.originalname ?? 'unknown'
+        const originalName = normalizeUploadFilename(originalNameRaw)
+        const extension = extensionFrom(file.mimetype, originalName)
+        const key = buildObjectKey(req.user!.id, id, extension)
+        const fallbackFilename = buildAsciiFallbackFilename(originalName, extension)
+
+        await uploadObject({
+          key,
+          body: file.buffer,
+          contentType: file.mimetype,
+          contentDisposition: buildContentDisposition(originalName, fallbackFilename),
+          metadata: {
+            owner: req.user!.id,
+          },
+        })
+
+        const record = await db.createMediaObject({
+          id,
+          ownerId: req.user!.id,
+          originalName,
+          storedKey: key,
+          mimeType: file.mimetype,
+          sizeBytes: file.size,
+          width: metadata.width ?? null,
+          height: metadata.height ?? null,
+        })
+
+        await publishMediaEvent({
+          id: record.id,
+          ownerId: record.ownerId,
+          storedKey: record.storedKey,
+          action: 'uploaded',
+          timestamp: new Date().toISOString(),
+        })
+
+        const downloadUrl = await buildDownloadUrl(record.storedKey, record.originalName)
+        items.push({ ...record, url: downloadUrl })
+      } catch (error) {
+        failed.push({
+          fileName: file.originalname,
+          message: error instanceof Error ? error.message : 'Upload failed',
+        })
+      }
     }
-    const id = uuid()
-    const originalNameRaw = req.file.originalname ?? 'unknown'
-    const originalName = normalizeUploadFilename(originalNameRaw)
-    const extension = extensionFrom(req.file.mimetype, originalName)
-    const key = buildObjectKey(req.user!.id, id, extension)
-    const fallbackFilename = buildAsciiFallbackFilename(originalName, extension)
 
-    await uploadObject({
-      key,
-      body: req.file.buffer,
-      contentType: req.file.mimetype,
-      contentDisposition: buildContentDisposition(originalName, fallbackFilename),
-      metadata: {
-        owner: req.user!.id,
-      },
-    })
+    if (items.length === 0) {
+      return res.status(400).json({
+        message: failed[0]?.message || 'Upload failed',
+        failed,
+      })
+    }
 
-    const record = await db.createMediaObject({
-      id,
-      ownerId: req.user!.id,
-      originalName,
-      storedKey: key,
-      mimeType: req.file.mimetype,
-      sizeBytes: req.file.size,
-      width: metadata.width ?? null,
-      height: metadata.height ?? null,
-    })
+    if (items.length === 1 && failed.length === 0) {
+      return res.status(201).json(items[0])
+    }
 
-    await publishMediaEvent({
-      id: record.id,
-      ownerId: record.ownerId,
-      storedKey: record.storedKey,
-      action: 'uploaded',
-      timestamp: new Date().toISOString(),
-    })
-
-    const downloadUrl = await buildDownloadUrl(record.storedKey, record.originalName)
-
-    return res.status(201).json({
-      ...record,
-      url: downloadUrl,
-    })
+    return res.status(201).json({ items, failed })
   }),
 )
 
